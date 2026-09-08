@@ -1,0 +1,16 @@
+{
+  "name": "visitor-analytics",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create visitor_analytics",
+    "db:migrate:local": "wrangler d1 execute visitor_analytics --local --file=./schema.sql",
+    "db:migrate:remote": "wrangler d1 execute visitor_analytics --remote --file=./schema.sql",
+    "secrets": "echo 'Run: wrangler secret put DASHBOARD_PASSWORD   and   wrangler secret put HASH_SALT'"
+  },
+  "devDependencies": {
+    "wrangler": "^4.129.1"
+  }
+}
