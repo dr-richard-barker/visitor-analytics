@@ -44,6 +44,24 @@ function isBot(ua) {
   );
 }
 
+// Bounded to exactly these 6 values — /collect is public and unauthenticated,
+// so this must never grow from raw attacker input (that's how a chart's color
+// legend blows past 8 series). utm_medium can steer classification even when
+// referrer_host is empty or ambiguous, but only into one of the 6 buckets.
+function categorizeSource(referrerHost, utmMedium) {
+  const um = (utmMedium || '').toLowerCase();
+  if (um === 'social') return 'Social';
+  if (um === 'search' || um === 'cpc' || um === 'ppc') return 'Search';
+  if (!referrerHost) return 'Direct';
+  const h = referrerHost.toLowerCase();
+  if (h === 'dr-richard-barker.github.io') return 'Internal';
+  if (/(^|\.)google\.\w+$|(^|\.)bing\.com$|(^|\.)duckduckgo\.com$|(^|\.)search\.yahoo\.com$|(^|\.)baidu\.com$|(^|\.)yandex\.\w+$|(^|\.)ecosia\.org$/.test(h))
+    return 'Search';
+  if (/(^|\.)(x|twitter)\.com$|(^|\.)t\.co$|(^|\.)facebook\.com$|(^|\.)linkedin\.com$|(^|\.)reddit\.com$|(^|\.)mastodon\.\w+$|(^|\.)bsky\.app$|(^|\.)threads\.net$|(^|\.)news\.ycombinator\.com$|(^|\.)lobste\.rs$/.test(h))
+    return 'Social';
+  return 'Referral';
+}
+
 async function hashVisitor(ip, ua, salt) {
   const day = Math.floor(Date.now() / 86400000);
   const data = `${ip}|${ua}|${day}|${salt}`;
@@ -78,12 +96,16 @@ function clientSnippet(origin) {
     var seg = location.pathname.split('/').filter(Boolean)[0] || '(root)';
     var refHost = '';
     if (document.referrer) { try { refHost = new URL(document.referrer).hostname; } catch (e) {} }
+    var q = new URLSearchParams(location.search);
     var payload = JSON.stringify({
       site: seg,
       path: location.pathname,
       t: document.title ? document.title.slice(0, 120) : '',
       ref: refHost,
-      lang: (navigator.language || '').slice(0, 5)
+      lang: (navigator.language || '').slice(0, 5),
+      us: q.get('utm_source') || '',
+      um: q.get('utm_medium') || '',
+      uc: q.get('utm_campaign') || ''
     });
     var url = '${origin}/collect';
     if (navigator.sendBeacon) {
@@ -115,18 +137,22 @@ async function handleCollect(request, env, ctx) {
   const title = body.t ? String(body.t).slice(0, 120) : null;
   const referrerHost = body.ref ? String(body.ref).slice(0, 255) : '';
   const lang = body.lang ? String(body.lang).slice(0, 5) : null;
+  const utmSource = body.us ? String(body.us).slice(0, 100) : null;
+  const utmMedium = body.um ? String(body.um).slice(0, 100) : null;
+  const utmCampaign = body.uc ? String(body.uc).slice(0, 100) : null;
 
   const { device, browser, os } = parseUA(ua);
   const country = (request.cf && request.cf.country) || 'XX';
   const ip = request.headers.get('CF-Connecting-IP') || '';
   const visitorHash = await hashVisitor(ip, ua, env.HASH_SALT || 'default-salt-change-me');
+  const sourceCategory = categorizeSource(referrerHost, utmMedium);
 
   ctx.waitUntil(
     env.DB.prepare(
-      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash, utm_source, utm_medium, utm_campaign, source_category)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     )
-      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash)
+      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash, utmSource, utmMedium, utmCampaign, sourceCategory)
       .run()
   );
 
@@ -143,13 +169,17 @@ async function handleStats(request, env) {
   const params = site ? [since, site] : [since];
   const q = (sql) => env.DB.prepare(sql).bind(...params);
 
-  const [totals, daily, sites, paths, referrers, countries, devices, browsers, oses, allSites] = await env.DB.batch([
+  const [totals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries, devices, browsers, oses, allSites] = await env.DB.batch([
     q(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors FROM pageviews ${where}`),
     q(`SELECT CAST(ts/86400000 AS INTEGER) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors
        FROM pageviews ${where} GROUP BY day ORDER BY day`),
     q(`SELECT site, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors FROM pageviews ${where} GROUP BY site ORDER BY views DESC LIMIT 20`),
     q(`SELECT site, path, COUNT(*) AS views FROM pageviews ${where} GROUP BY site, path ORDER BY views DESC LIMIT 20`),
     q(`SELECT referrer_host, COUNT(*) AS views FROM pageviews ${where} AND referrer_host != '' GROUP BY referrer_host ORDER BY views DESC LIMIT 15`),
+    q(`SELECT COALESCE(NULLIF(source_category, ''), 'Other') AS category, COUNT(*) AS views
+       FROM pageviews ${where} GROUP BY category ORDER BY views DESC`),
+    q(`SELECT utm_source, utm_campaign, utm_medium, COUNT(*) AS views FROM pageviews ${where}
+       AND utm_source IS NOT NULL AND utm_source != '' GROUP BY utm_source, utm_campaign, utm_medium ORDER BY views DESC LIMIT 15`),
     q(`SELECT country, COUNT(*) AS views FROM pageviews ${where} GROUP BY country ORDER BY views DESC LIMIT 15`),
     q(`SELECT device, COUNT(*) AS views FROM pageviews ${where} GROUP BY device ORDER BY views DESC`),
     q(`SELECT browser, COUNT(*) AS views FROM pageviews ${where} GROUP BY browser ORDER BY views DESC LIMIT 10`),
@@ -165,6 +195,8 @@ async function handleStats(request, env) {
     sites: sites.results,
     paths: paths.results,
     referrers: referrers.results,
+    sourceBreakdown: sourceBreakdown.results,
+    campaigns: campaigns.results,
     countries: countries.results,
     devices: devices.results,
     browsers: browsers.results,
@@ -186,9 +218,16 @@ const DASHBOARD_HTML = `<!doctype html>
     color-scheme: light dark;
     --bg: #f7f7f8; --panel: #ffffff; --text: #1a1a1e; --muted: #6b6b76;
     --border: #e4e4e8; --accent: #4f46e5; --bar: #c7c2fb;
+    /* Categorical palette (validated: fixed hue order, CVD-safe adjacent pairs) */
+    --src-direct: #2a78d6; --src-search: #eb6834; --src-social: #1baf7a;
+    --src-referral: #eda100; --src-internal: #e87ba4; --src-other: #008300;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #16161a; --panel: #1f1f24; --text: #f0f0f2; --muted: #9a9aa4; --border: #2e2e35; --accent: #8b7ffb; --bar: #3a3560; }
+    :root {
+      --bg: #16161a; --panel: #1f1f24; --text: #f0f0f2; --muted: #9a9aa4; --border: #2e2e35; --accent: #8b7ffb; --bar: #3a3560;
+      --src-direct: #3987e5; --src-search: #d95926; --src-social: #199e70;
+      --src-referral: #c98500; --src-internal: #d55181; --src-other: #008300;
+    }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -205,6 +244,12 @@ const DASHBOARD_HTML = `<!doctype html>
   .chart h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .bars { display: flex; align-items: flex-end; gap: 2px; height: 100px; }
   .bars .bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; }
+  .srcbar { display: flex; height: 28px; border-radius: 6px; overflow: hidden; background: var(--border); gap: 2px; }
+  .srcbar .seg { min-width: 3px; }
+  .srclegend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 14px; font-size: 13px; }
+  .srclegend .item { display: flex; align-items: center; gap: 7px; }
+  .srclegend .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .srclegend .pct { color: var(--muted); }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
   .panel h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
@@ -232,13 +277,19 @@ const DASHBOARD_HTML = `<!doctype html>
 <main>
   <div class="cards" id="cards"></div>
   <div class="chart">
+    <h2>Traffic sources</h2>
+    <div class="srcbar" id="srcBar"></div>
+    <div class="srclegend" id="srcLegend"></div>
+  </div>
+  <div class="chart">
     <h2>Pageviews per day</h2>
     <div class="bars" id="bars"></div>
   </div>
   <div class="grid">
+    <div class="panel"><h2>Referring sites</h2><table><tbody id="tblReferrers"></tbody></table></div>
+    <div class="panel" id="panelCampaigns" hidden><h2>Campaigns</h2><table><tbody id="tblCampaigns"></tbody></table></div>
     <div class="panel"><h2>Top sites</h2><table><tbody id="tblSites"></tbody></table></div>
     <div class="panel"><h2>Top pages</h2><table><tbody id="tblPaths"></tbody></table></div>
-    <div class="panel"><h2>Referrers</h2><table><tbody id="tblReferrers"></tbody></table></div>
     <div class="panel"><h2>Countries</h2><table><tbody id="tblCountries"></tbody></table></div>
     <div class="panel"><h2>Devices</h2><table><tbody id="tblDevices"></tbody></table></div>
     <div class="panel"><h2>Browsers</h2><table><tbody id="tblBrowsers"></tbody></table></div>
@@ -247,6 +298,44 @@ const DASHBOARD_HTML = `<!doctype html>
 </main>
 <script>
 function el(tag, cls) { var e = document.createElement(tag); if (cls) e.className = cls; return e; }
+
+var SRC_ORDER = ['Direct', 'Search', 'Social', 'Referral', 'Internal', 'Other'];
+var SRC_COLORS = {
+  Direct: 'var(--src-direct)', Search: 'var(--src-search)', Social: 'var(--src-social)',
+  Referral: 'var(--src-referral)', Internal: 'var(--src-internal)', Other: 'var(--src-other)'
+};
+
+function fillSourceBar(rows) {
+  var bar = document.getElementById('srcBar');
+  var legend = document.getElementById('srcLegend');
+  bar.textContent = '';
+  legend.textContent = '';
+  var byCategory = {};
+  var total = 0;
+  (rows || []).forEach(function (r) { byCategory[r.category] = r.views; total += r.views; });
+  if (!total) {
+    var empty = el('div', 'empty'); empty.textContent = 'No data yet';
+    legend.appendChild(empty);
+    return;
+  }
+  SRC_ORDER.forEach(function (cat) {
+    var views = byCategory[cat] || 0;
+    if (!views) return;
+    var pct = 100 * views / total;
+    var seg = el('div', 'seg');
+    seg.style.width = pct + '%';
+    seg.style.background = SRC_COLORS[cat];
+    seg.title = cat + ': ' + views + ' views (' + pct.toFixed(1) + '%)';
+    bar.appendChild(seg);
+
+    var item = el('div', 'item');
+    var swatch = el('span', 'swatch'); swatch.style.background = SRC_COLORS[cat];
+    var label = el('span'); label.textContent = cat;
+    var pctSpan = el('span', 'pct'); pctSpan.textContent = views + ' · ' + pct.toFixed(1) + '%';
+    item.appendChild(swatch); item.appendChild(label); item.appendChild(pctSpan);
+    legend.appendChild(item);
+  });
+}
 
 function fillTable(tbodyId, rows, labelKey, valueKey) {
   var tbody = document.getElementById(tbodyId);
@@ -319,11 +408,17 @@ async function load() {
   if (!res.ok) return;
   var data = await res.json();
   fillCards(data.totals, data.daily.length);
+  fillSourceBar(data.sourceBreakdown);
   fillBars(data.daily);
   fillSiteOptions(data.allSites, site);
   fillTable('tblSites', data.sites, 'site', 'views');
   fillTable('tblPaths', data.paths.map(function(p){ return { label: p.site + p.path, views: p.views }; }), 'label', 'views');
   fillTable('tblReferrers', data.referrers, 'referrer_host', 'views');
+  document.getElementById('panelCampaigns').hidden = !(data.campaigns && data.campaigns.length);
+  fillTable('tblCampaigns', (data.campaigns || []).map(function (c) {
+    var label = c.utm_source + (c.utm_campaign ? ' / ' + c.utm_campaign : '') + (c.utm_medium ? ' (' + c.utm_medium + ')' : '');
+    return { label: label, views: c.views };
+  }), 'label', 'views');
   fillTable('tblCountries', data.countries, 'country', 'views');
   fillTable('tblDevices', data.devices, 'device', 'views');
   fillTable('tblBrowsers', data.browsers, 'browser', 'views');

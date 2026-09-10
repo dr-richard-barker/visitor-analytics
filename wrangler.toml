@@ -8,4 +8,4 @@ ALLOWED_ORIGIN = "https://dr-richard-barker.github.io"
 [[d1_databases]]
 binding = "DB"
 database_name = "visitor_analytics"
-database_id = "00000000-0000-0000-0000-000000000000"  # replace with the id printed by `wrangler d1 create visitor_analytics`
+database_id = "22244e33-c387-442b-a111-d6f1f3d89142"

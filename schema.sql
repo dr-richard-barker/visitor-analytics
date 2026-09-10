@@ -12,8 +12,13 @@ CREATE TABLE IF NOT EXISTS pageviews (
   browser       TEXT,                    -- coarse browser family
   os            TEXT,                    -- coarse OS family
   lang          TEXT,                    -- 2-letter primary language subtag
-  visitor_hash  TEXT NOT NULL            -- sha256(ip + UA + daily salt), truncated; rotates every day, never reversible to an IP
+  visitor_hash  TEXT NOT NULL,           -- sha256(ip + UA + daily salt), truncated; rotates every day, never reversible to an IP
+  utm_source    TEXT,                    -- ?utm_source= query param, if present
+  utm_medium    TEXT,                    -- ?utm_medium= query param, if present
+  utm_campaign  TEXT,                    -- ?utm_campaign= query param, if present
+  source_category TEXT                   -- computed server-side: Direct | Search | Social | Internal | Referral | Other
 );
 
 CREATE INDEX IF NOT EXISTS idx_pageviews_ts   ON pageviews(ts);
 CREATE INDEX IF NOT EXISTS idx_pageviews_site ON pageviews(site, ts);
+CREATE INDEX IF NOT EXISTS idx_pageviews_source_category ON pageviews(source_category, ts);
