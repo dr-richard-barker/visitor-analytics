@@ -93,11 +93,34 @@ function clientSnippet(origin) {
   return `(function(){
   try {
     if (navigator.doNotTrack === "1" || window.doNotTrack === "1" || navigator.msDoNotTrack === "1") return;
+    var url = '${origin}/collect';
+    function send(payload) {
+      var body = JSON.stringify(payload);
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, new Blob([body], { type: 'text/plain' }));
+      } else {
+        fetch(url, { method: 'POST', body: body, keepalive: true, headers: { 'Content-Type': 'text/plain' } }).catch(function () {});
+      }
+    }
+
+    // Per-page-load id (random, single-use — only correlates this page's own
+    // heartbeats, never reused). Per-tab session id lives in sessionStorage:
+    // cleared when the tab closes, never sent as a cookie, and — because every
+    // one of these sites shares the same origin — it naturally groups a visit
+    // that hops between different projects in one sitting.
+    function rid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+    var pid = (crypto && crypto.randomUUID) ? crypto.randomUUID() : rid();
+    var sid = '';
+    try {
+      sid = sessionStorage.getItem('va_sid') || '';
+      if (!sid) { sid = rid(); sessionStorage.setItem('va_sid', sid); }
+    } catch (e) {}
+
     var seg = location.pathname.split('/').filter(Boolean)[0] || '(root)';
     var refHost = '';
     if (document.referrer) { try { refHost = new URL(document.referrer).hostname; } catch (e) {} }
     var q = new URLSearchParams(location.search);
-    var payload = JSON.stringify({
+    send({
       site: seg,
       path: location.pathname,
       t: document.title ? document.title.slice(0, 120) : '',
@@ -105,14 +128,22 @@ function clientSnippet(origin) {
       lang: (navigator.language || '').slice(0, 5),
       us: q.get('utm_source') || '',
       um: q.get('utm_medium') || '',
-      uc: q.get('utm_campaign') || ''
+      uc: q.get('utm_campaign') || '',
+      pid: pid,
+      sid: sid
     });
-    var url = '${origin}/collect';
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(url, new Blob([payload], { type: 'text/plain' }));
-    } else {
-      fetch(url, { method: 'POST', body: payload, keepalive: true, headers: { 'Content-Type': 'text/plain' } }).catch(function () {});
-    }
+
+    // Engaged-time heartbeat: only while the tab is actually visible, capped
+    // at 1 hour of pings. This is an estimate, not a stopwatch — same
+    // approach real privacy-respecting analytics tools use, since unload
+    // events are unreliable (especially on mobile).
+    var pings = 0;
+    var timer = setInterval(function () {
+      if (document.visibilityState !== 'visible') return;
+      pings++;
+      if (pings > 240) { clearInterval(timer); return; }
+      send({ k: 'hb', pid: pid });
+    }, 15000);
   } catch (e) {}
 })();
 `;
@@ -132,6 +163,20 @@ async function handleCollect(request, env, ctx) {
 
   if (isBot(ua)) return new Response(null, { status: 204, headers: corsHeaders });
 
+  if (body.k === 'hb') {
+    const pageviewId = body.pid ? String(body.pid).slice(0, 64) : '';
+    if (pageviewId) {
+      ctx.waitUntil(
+        env.DB.prepare(
+          `UPDATE pageviews SET duration_sec = MIN(duration_sec + 15, 3600) WHERE pageview_id = ?`
+        )
+          .bind(pageviewId)
+          .run()
+      );
+    }
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
   const site = String(body.site || '(root)').slice(0, 64);
   const path = String(body.path || '/').slice(0, 512);
   const title = body.t ? String(body.t).slice(0, 120) : null;
@@ -140,19 +185,25 @@ async function handleCollect(request, env, ctx) {
   const utmSource = body.us ? String(body.us).slice(0, 100) : null;
   const utmMedium = body.um ? String(body.um).slice(0, 100) : null;
   const utmCampaign = body.uc ? String(body.uc).slice(0, 100) : null;
+  const pageviewId = body.pid ? String(body.pid).slice(0, 64) : null;
+  const sessionId = body.sid ? String(body.sid).slice(0, 64) : null;
 
   const { device, browser, os } = parseUA(ua);
-  const country = (request.cf && request.cf.country) || 'XX';
+  const cf = request.cf || {};
+  const country = cf.country || 'XX';
+  const city = cf.city || null;
+  const region = cf.region || null;
+  const asnOrg = cf.asOrganization || null;
   const ip = request.headers.get('CF-Connecting-IP') || '';
   const visitorHash = await hashVisitor(ip, ua, env.HASH_SALT || 'default-salt-change-me');
   const sourceCategory = categorizeSource(referrerHost, utmMedium);
 
   ctx.waitUntil(
     env.DB.prepare(
-      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash, utm_source, utm_medium, utm_campaign, source_category)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash, utm_source, utm_medium, utm_campaign, source_category, city, region, asn_org, pageview_id, session_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     )
-      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash, utmSource, utmMedium, utmCampaign, sourceCategory)
+      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash, utmSource, utmMedium, utmCampaign, sourceCategory, city, region, asnOrg, pageviewId, sessionId)
       .run()
   );
 
@@ -169,8 +220,11 @@ async function handleStats(request, env) {
   const params = site ? [since, site] : [since];
   const q = (sql) => env.DB.prepare(sql).bind(...params);
 
-  const [totals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries, devices, browsers, oses, allSites] = await env.DB.batch([
-    q(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors FROM pageviews ${where}`),
+  const [
+    totals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries,
+    cities, networks, languages, devices, browsers, oses, engagement, allSites,
+  ] = await env.DB.batch([
+    q(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors, AVG(duration_sec) AS avgDuration FROM pageviews ${where}`),
     q(`SELECT CAST(ts/86400000 AS INTEGER) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors
        FROM pageviews ${where} GROUP BY day ORDER BY day`),
     q(`SELECT site, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors FROM pageviews ${where} GROUP BY site ORDER BY views DESC LIMIT 20`),
@@ -181,16 +235,25 @@ async function handleStats(request, env) {
     q(`SELECT utm_source, utm_campaign, utm_medium, COUNT(*) AS views FROM pageviews ${where}
        AND utm_source IS NOT NULL AND utm_source != '' GROUP BY utm_source, utm_campaign, utm_medium ORDER BY views DESC LIMIT 15`),
     q(`SELECT country, COUNT(*) AS views FROM pageviews ${where} GROUP BY country ORDER BY views DESC LIMIT 15`),
+    q(`SELECT city, country, COUNT(*) AS views FROM pageviews ${where}
+       AND city IS NOT NULL AND city != '' GROUP BY city, country ORDER BY views DESC LIMIT 15`),
+    q(`SELECT asn_org, COUNT(*) AS views FROM pageviews ${where}
+       AND asn_org IS NOT NULL AND asn_org != '' GROUP BY asn_org ORDER BY views DESC LIMIT 15`),
+    q(`SELECT lang, COUNT(*) AS views FROM pageviews ${where} AND lang IS NOT NULL AND lang != '' GROUP BY lang ORDER BY views DESC LIMIT 10`),
     q(`SELECT device, COUNT(*) AS views FROM pageviews ${where} GROUP BY device ORDER BY views DESC`),
     q(`SELECT browser, COUNT(*) AS views FROM pageviews ${where} GROUP BY browser ORDER BY views DESC LIMIT 10`),
     q(`SELECT os, COUNT(*) AS views FROM pageviews ${where} GROUP BY os ORDER BY views DESC LIMIT 10`),
+    q(`SELECT AVG(cnt) AS avgPagesPerSession, COUNT(*) AS sessionCount,
+              100.0 * SUM(CASE WHEN cnt = 1 THEN 1 ELSE 0 END) / COUNT(*) AS bounceRatePct
+       FROM (SELECT session_id, COUNT(*) AS cnt FROM pageviews ${where}
+             AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id)`),
     env.DB.prepare(`SELECT DISTINCT site FROM pageviews ORDER BY site`),
   ]);
 
   const body = {
     days,
     site,
-    totals: totals.results[0] || { views: 0, visitors: 0 },
+    totals: totals.results[0] || { views: 0, visitors: 0, avgDuration: 0 },
     daily: daily.results,
     sites: sites.results,
     paths: paths.results,
@@ -198,9 +261,13 @@ async function handleStats(request, env) {
     sourceBreakdown: sourceBreakdown.results,
     campaigns: campaigns.results,
     countries: countries.results,
+    cities: cities.results,
+    networks: networks.results,
+    languages: languages.results,
     devices: devices.results,
     browsers: browsers.results,
     oses: oses.results,
+    engagement: engagement.results[0] || { avgPagesPerSession: 0, sessionCount: 0, bounceRatePct: 0 },
     allSites: allSites.results.map((r) => r.site),
   };
 
@@ -291,6 +358,9 @@ const DASHBOARD_HTML = `<!doctype html>
     <div class="panel"><h2>Top sites</h2><table><tbody id="tblSites"></tbody></table></div>
     <div class="panel"><h2>Top pages</h2><table><tbody id="tblPaths"></tbody></table></div>
     <div class="panel"><h2>Countries</h2><table><tbody id="tblCountries"></tbody></table></div>
+    <div class="panel"><h2>Cities</h2><table><tbody id="tblCities"></tbody></table></div>
+    <div class="panel"><h2>Networks</h2><table><tbody id="tblNetworks"></tbody></table></div>
+    <div class="panel"><h2>Languages</h2><table><tbody id="tblLanguages"></tbody></table></div>
     <div class="panel"><h2>Devices</h2><table><tbody id="tblDevices"></tbody></table></div>
     <div class="panel"><h2>Browsers</h2><table><tbody id="tblBrowsers"></tbody></table></div>
     <div class="panel"><h2>Operating systems</h2><table><tbody id="tblOses"></tbody></table></div>
@@ -357,13 +427,22 @@ function fillTable(tbodyId, rows, labelKey, valueKey) {
   });
 }
 
-function fillCards(totals, dayCount) {
+function formatDuration(sec) {
+  sec = Math.round(sec || 0);
+  var m = Math.floor(sec / 60), s = sec % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function fillCards(totals, dayCount, engagement) {
   var cards = document.getElementById('cards');
   cards.textContent = '';
   var items = [
     ['Pageviews', totals.views],
     ['Unique visitors', totals.visitors],
-    ['Avg. views / day', dayCount ? Math.round(totals.views / dayCount) : 0]
+    ['Avg. views / day', dayCount ? Math.round(totals.views / dayCount) : 0],
+    ['Avg. time on page', formatDuration(totals.avgDuration)],
+    ['Pages / session', (engagement.avgPagesPerSession || 0).toFixed(1)],
+    ['Bounce rate', Math.round(engagement.bounceRatePct || 0) + '%']
   ];
   items.forEach(function (pair) {
     var card = el('div', 'card');
@@ -407,7 +486,7 @@ async function load() {
   var res = await fetch('/api/stats?' + qs);
   if (!res.ok) return;
   var data = await res.json();
-  fillCards(data.totals, data.daily.length);
+  fillCards(data.totals, data.daily.length, data.engagement);
   fillSourceBar(data.sourceBreakdown);
   fillBars(data.daily);
   fillSiteOptions(data.allSites, site);
@@ -420,6 +499,11 @@ async function load() {
     return { label: label, views: c.views };
   }), 'label', 'views');
   fillTable('tblCountries', data.countries, 'country', 'views');
+  fillTable('tblCities', (data.cities || []).map(function (c) {
+    return { label: c.city + ', ' + c.country, views: c.views };
+  }), 'label', 'views');
+  fillTable('tblNetworks', data.networks, 'asn_org', 'views');
+  fillTable('tblLanguages', data.languages, 'lang', 'views');
   fillTable('tblDevices', data.devices, 'device', 'views');
   fillTable('tblBrowsers', data.browsers, 'browser', 'views');
   fillTable('tblOses', data.oses, 'os', 'views');

@@ -16,9 +16,17 @@ CREATE TABLE IF NOT EXISTS pageviews (
   utm_source    TEXT,                    -- ?utm_source= query param, if present
   utm_medium    TEXT,                    -- ?utm_medium= query param, if present
   utm_campaign  TEXT,                    -- ?utm_campaign= query param, if present
-  source_category TEXT                   -- computed server-side: Direct | Search | Social | Internal | Referral | Other
+  source_category TEXT,                  -- computed server-side: Direct | Search | Social | Internal | Referral | Other
+  city          TEXT,                    -- city from Cloudflare edge geolocation (coarse; no lat/long ever stored)
+  region        TEXT,                    -- state/province from Cloudflare edge geolocation
+  asn_org       TEXT,                    -- network operator name, e.g. "Comcast Cable", "Stanford University" — the network, not a person
+  duration_sec  INTEGER NOT NULL DEFAULT 0, -- approximate active time on page, from visibility-gated heartbeats; capped server-side
+  pageview_id   TEXT,                    -- random, single-use, generated client-side per page load; correlates heartbeats to this row only
+  session_id    TEXT                     -- random, sessionStorage-scoped (cleared when the tab closes); groups pageviews within one visit
 );
 
 CREATE INDEX IF NOT EXISTS idx_pageviews_ts   ON pageviews(ts);
 CREATE INDEX IF NOT EXISTS idx_pageviews_site ON pageviews(site, ts);
 CREATE INDEX IF NOT EXISTS idx_pageviews_source_category ON pageviews(source_category, ts);
+CREATE INDEX IF NOT EXISTS idx_pageviews_pageview_id ON pageviews(pageview_id);
+CREATE INDEX IF NOT EXISTS idx_pageviews_session_id ON pageviews(session_id);
