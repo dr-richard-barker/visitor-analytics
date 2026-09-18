@@ -272,7 +272,10 @@ async function handleStats(request, env) {
        FROM pageviews ${where} GROUP BY category ORDER BY views DESC`),
     q(`SELECT utm_source, utm_campaign, utm_medium, COUNT(*) AS views FROM pageviews ${where}
        AND utm_source IS NOT NULL AND utm_source != '' GROUP BY utm_source, utm_campaign, utm_medium ORDER BY views DESC LIMIT 15`),
-    q(`SELECT country, COUNT(*) AS views FROM pageviews ${where} GROUP BY country ORDER BY views DESC LIMIT 15`),
+    // No LIMIT: the map needs every country that has any data, not just a top-N —
+    // there are at most ~249 possible values, so this is inherently bounded.
+    q(`SELECT country, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors, AVG(duration_sec) AS avgDuration
+       FROM pageviews ${where} GROUP BY country ORDER BY views DESC`),
     q(`SELECT city, country, COUNT(*) AS views FROM pageviews ${where}
        AND city IS NOT NULL AND city != '' GROUP BY city, country ORDER BY views DESC LIMIT 15`),
     q(`SELECT asn_org, COUNT(*) AS views FROM pageviews ${where}
@@ -354,16 +357,28 @@ const DASHBOARD_HTML = `<!doctype html>
   .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
   .chart h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-  .bars { display: flex; align-items: flex-end; gap: 2px; height: 100px; }
+  .barchart { display: flex; gap: 8px; }
+  .barchart-y { flex: none; width: 34px; height: 100px; display: flex; flex-direction: column; justify-content: space-between; text-align: right; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .barchart-main { flex: 1; min-width: 0; }
+  .bars { display: flex; align-items: flex-end; gap: 2px; height: 100px; border-left: 1px solid var(--border); border-bottom: 1px solid var(--border); }
   .bars .bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; }
+  .barchart-x { display: flex; gap: 2px; margin-top: 4px; }
+  .barchart-x span { flex: 1; text-align: center; font-size: 10px; color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .chartrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 20px; }
   .chartrow .chart { margin-bottom: 0; }
-  .mapwrap { width: 100%; }
+  .mapwrap { width: 100%; position: relative; }
   #worldMap { width: 100%; height: auto; display: block; }
-  #worldMap path { stroke: var(--panel); stroke-width: 0.5; }
-  #worldMap path.has-data { cursor: default; }
+  #worldMap path { stroke: var(--panel); stroke-width: 0.5; transition: filter .1s; }
+  #worldMap path.has-data { cursor: pointer; }
+  #worldMap path.hovered { filter: brightness(1.25); stroke: var(--text); stroke-width: 1; }
   .maplegend { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 12px; font-size: 12px; color: var(--muted); }
   .maplegend .swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
+  .maptip { position: absolute; z-index: 10; pointer-events: none; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18); min-width: 150px; }
+  .maptip[hidden] { display: none; }
+  .maptip .tip-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--text); }
+  .maptip .tip-row { display: flex; justify-content: space-between; gap: 16px; padding: 1px 0; }
+  .maptip .tip-row .tip-val { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+  .maptip .tip-row .tip-label { color: var(--muted); }
   .srcbar { display: flex; height: 28px; border-radius: 6px; overflow: hidden; background: var(--border); gap: 2px; }
   .srcbar .seg { min-width: 3px; }
   .srclegend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 14px; font-size: 13px; }
@@ -400,6 +415,7 @@ const DASHBOARD_HTML = `<!doctype html>
     <h2>Visitors by country</h2>
     <div class="mapwrap">
       <svg id="worldMap" viewBox="0 0 960 480" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div class="maptip" id="mapTip" hidden></div>
     </div>
     <div class="maplegend" id="mapLegend"></div>
   </div>
@@ -418,11 +434,23 @@ const DASHBOARD_HTML = `<!doctype html>
   <div class="chartrow">
     <div class="chart">
       <h2>Pageviews per day</h2>
-      <div class="bars" id="bars"></div>
+      <div class="barchart">
+        <div class="barchart-y" id="barsY"></div>
+        <div class="barchart-main">
+          <div class="bars" id="bars"></div>
+          <div class="barchart-x" id="barsX"></div>
+        </div>
+      </div>
     </div>
     <div class="chart">
-      <h2>Pageviews by hour of day</h2>
-      <div class="bars" id="hourBars"></div>
+      <h2>Pageviews by hour of day (UTC)</h2>
+      <div class="barchart">
+        <div class="barchart-y" id="hourBarsY"></div>
+        <div class="barchart-main">
+          <div class="bars" id="hourBars"></div>
+          <div class="barchart-x" id="hourBarsX"></div>
+        </div>
+      </div>
     </div>
   </div>
   <div class="grid">
@@ -540,18 +568,54 @@ function fillCards(totals, dayCount, engagement, returning) {
   });
 }
 
+// Rounds up to a "clean" axis max (1/2/5/10/20/50/100...) rather than the raw data max.
+function niceMax(v) {
+  if (v <= 0) return 1;
+  var mag = Math.pow(10, Math.floor(Math.log10(v)));
+  var norm = v / mag;
+  var nice = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return nice * mag;
+}
+
+function fillYAxis(yId, max) {
+  var yAxis = document.getElementById(yId);
+  yAxis.textContent = '';
+  [max, max / 2, 0].forEach(function (v) {
+    var t = el('span'); t.textContent = Math.round(v).toLocaleString();
+    yAxis.appendChild(t);
+  });
+}
+
+// Shows every Nth label (not all — with up to 90 daily bars every label would
+// overlap) but keeps an empty flex slot per bar so the shown ones still align.
+function fillXAxisLabels(xId, labels) {
+  var xAxis = document.getElementById(xId);
+  xAxis.textContent = '';
+  var n = labels.length;
+  var every = Math.max(1, Math.ceil(n / 6));
+  labels.forEach(function (label, i) {
+    var s = el('span');
+    if (i % every === 0 || i === n - 1) s.textContent = label;
+    xAxis.appendChild(s);
+  });
+}
+
 function fillBars(daily) {
   var bars = document.getElementById('bars');
   bars.textContent = '';
-  if (!daily || !daily.length) return;
-  var max = daily.reduce(function (m, d) { return Math.max(m, d.views); }, 1);
+  if (!daily || !daily.length) { fillYAxis('barsY', 1); fillXAxisLabels('barsX', []); return; }
+  var max = niceMax(daily.reduce(function (m, d) { return Math.max(m, d.views); }, 0));
+  fillYAxis('barsY', max);
+  var labels = [];
   daily.forEach(function (d) {
     var b = el('div', 'bar');
     b.style.height = Math.max(2, 100 * d.views / max) + '%';
     var date = new Date(d.day * 86400000);
     b.title = date.toISOString().slice(0, 10) + ': ' + d.views + ' views, ' + d.visitors + ' visitors';
     bars.appendChild(b);
+    labels.push(date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }));
   });
+  fillXAxisLabels('barsX', labels);
 }
 
 function fillHourBars(hourOfDay) {
@@ -559,14 +623,18 @@ function fillHourBars(hourOfDay) {
   bars.textContent = '';
   var byHour = {};
   (hourOfDay || []).forEach(function (h) { byHour[h.hour] = h.views; });
-  var max = Math.max.apply(null, [1].concat((hourOfDay || []).map(function (h) { return h.views; })));
+  var max = niceMax(Math.max.apply(null, [0].concat((hourOfDay || []).map(function (h) { return h.views; }))));
+  fillYAxis('hourBarsY', max);
+  var labels = [];
   for (var hour = 0; hour < 24; hour++) {
     var views = byHour[hour] || 0;
     var b = el('div', 'bar');
     b.style.height = Math.max(2, 100 * views / max) + '%';
     b.title = String(hour).padStart(2, '0') + ':00–' + String(hour).padStart(2, '0') + ':59 UTC: ' + views + ' views';
     bars.appendChild(b);
+    labels.push(String(hour));
   }
+  fillXAxisLabels('hourBarsX', labels);
 }
 
 // Log-scaled 7-step blue ramp (dataviz skill's sequential default, light->dark).
@@ -580,12 +648,70 @@ function colorForCount(count, maxCount) {
 }
 
 var mapBuilt = false;
-function fillMap(countries) {
+// Mutated (not reassigned by reference elsewhere) on every fillMap() call so
+// the hover handlers below — attached once — always read the latest slice,
+// including after the date-range/site filters change.
+var mapCountryStats = {};
+var mapTopCity = {};
+
+// The map is a pointer/touch-enhanced supplement, not a keyboard tab-stop:
+// 174 individual tab stops would hurt keyboard users far more than it helps,
+// and every number it shows is already reachable via the Countries/Cities
+// tables below (textContent throughout, same as elsewhere on this dashboard).
+function showMapTip(evt, cc) {
+  var tip = document.getElementById('mapTip');
+  var stats = mapCountryStats[cc];
+  tip.textContent = '';
+  var title = el('div', 'tip-title'); title.textContent = COUNTRY_NAMES[cc] || cc;
+  tip.appendChild(title);
+  var rows = stats
+    ? [
+        ['Views', stats.views.toLocaleString()],
+        ['Unique visitors', stats.visitors.toLocaleString()],
+        ['Avg. time on page', formatDuration(stats.avgDuration)],
+        ['Top city', mapTopCity[cc] || '(unknown)'],
+      ]
+    : [['', 'No visits recorded']];
+  rows.forEach(function (pair) {
+    var row = el('div', 'tip-row');
+    var label = el('span', 'tip-label'); label.textContent = pair[0];
+    var val = el('span', 'tip-val'); val.textContent = pair[1];
+    row.appendChild(label); row.appendChild(val);
+    tip.appendChild(row);
+  });
+  tip.hidden = false;
+  positionMapTip(evt);
+}
+
+function positionMapTip(evt) {
+  var tip = document.getElementById('mapTip');
+  var wrapRect = tip.parentElement.getBoundingClientRect();
+  var tipRect = tip.getBoundingClientRect();
+  var x = evt.clientX - wrapRect.left + 14;
+  var y = evt.clientY - wrapRect.top + 14;
+  if (x + tipRect.width > wrapRect.width) x = evt.clientX - wrapRect.left - tipRect.width - 14;
+  if (y + tipRect.height > wrapRect.height) y = evt.clientY - wrapRect.top - tipRect.height - 14;
+  tip.style.left = Math.max(0, x) + 'px';
+  tip.style.top = Math.max(0, y) + 'px';
+}
+
+function hideMapTip() {
+  document.getElementById('mapTip').hidden = true;
+}
+
+function fillMap(countries, cities) {
   var svg = document.getElementById('worldMap');
   var legend = document.getElementById('mapLegend');
-  var byCountry = {};
+  mapCountryStats = {};
   var max = 1;
-  (countries || []).forEach(function (c) { byCountry[c.country] = c.views; max = Math.max(max, c.views); });
+  (countries || []).forEach(function (c) {
+    mapCountryStats[c.country] = { views: c.views, visitors: c.visitors, avgDuration: c.avgDuration };
+    max = Math.max(max, c.views);
+  });
+  mapTopCity = {};
+  (cities || []).forEach(function (c) {
+    if (!mapTopCity[c.country]) mapTopCity[c.country] = c.city; // cities[] already sorted by views DESC
+  });
 
   if (!mapBuilt) {
     svg.textContent = '';
@@ -593,6 +719,9 @@ function fillMap(countries) {
       var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       path.setAttribute('d', WORLD_PATHS[cc]);
       path.setAttribute('data-cc', cc);
+      path.addEventListener('pointerenter', function (evt) { path.classList.add('hovered'); showMapTip(evt, cc); });
+      path.addEventListener('pointermove', positionMapTip);
+      path.addEventListener('pointerleave', function () { path.classList.remove('hovered'); hideMapTip(); });
       svg.appendChild(path);
     });
     mapBuilt = true;
@@ -602,14 +731,10 @@ function fillMap(countries) {
   var paths = svg.querySelectorAll('path[data-cc]');
   paths.forEach(function (path) {
     var cc = path.getAttribute('data-cc');
-    var views = byCountry[cc] || 0;
+    var views = mapCountryStats[cc] ? mapCountryStats[cc].views : 0;
     var color = colorForCount(views, max);
     path.setAttribute('fill', color || noData);
     path.classList.toggle('has-data', !!color);
-    var name = COUNTRY_NAMES[cc] || cc;
-    var titleEl = path.querySelector('title');
-    if (!titleEl) { titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title'); path.appendChild(titleEl); }
-    titleEl.textContent = views ? (name + ': ' + views + ' views') : name;
   });
 
   legend.textContent = '';
@@ -648,7 +773,7 @@ async function load() {
   if (!res.ok) return;
   var data = await res.json();
   fillCards(data.totals, data.daily.length, data.engagement, data.returning);
-  fillMap(data.countries);
+  fillMap(data.countries, data.cities);
   fillCategoryBar('srcBar', 'srcLegend', data.sourceBreakdown, 'category', 'views', SRC_ORDER, SRC_COLORS, 'views');
   fillCategoryBar('retBar', 'retLegend', data.returning, 'visitorType', 'visitors', RET_ORDER, RET_COLORS, 'visitors');
   fillBars(data.daily);
