@@ -12,6 +12,8 @@
 // is `client_id` (localStorage, opaque random value) used only to classify
 // new vs. returning visitors — see clientSnippet() and visitor_first_seen.
 
+import { WORLD_PATHS, COUNTRY_NAMES } from './world_map_data.js';
+
 function parseUA(ua) {
   ua = ua || '';
   let device = 'desktop';
@@ -258,7 +260,7 @@ async function handleStats(request, env) {
 
   const [
     totals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries,
-    cities, networks, languages, devices, browsers, oses, engagement, returning, allSites,
+    cities, networks, languages, devices, browsers, oses, engagement, hourOfDay, returning, allSites,
   ] = await env.DB.batch([
     q(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors, AVG(duration_sec) AS avgDuration FROM pageviews ${where}`),
     q(`SELECT CAST(ts/86400000 AS INTEGER) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors
@@ -283,6 +285,8 @@ async function handleStats(request, env) {
               100.0 * SUM(CASE WHEN cnt = 1 THEN 1 ELSE 0 END) / COUNT(*) AS bounceRatePct
        FROM (SELECT session_id, COUNT(*) AS cnt FROM pageviews ${where}
              AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id)`),
+    q(`SELECT CAST(strftime('%H', ts/1000, 'unixepoch') AS INTEGER) AS hour, COUNT(*) AS views
+       FROM pageviews ${where} GROUP BY hour ORDER BY hour`),
     returningQuery,
     env.DB.prepare(`SELECT DISTINCT site FROM pageviews ORDER BY site`),
   ]);
@@ -292,6 +296,7 @@ async function handleStats(request, env) {
     site,
     totals: totals.results[0] || { views: 0, visitors: 0, avgDuration: 0 },
     daily: daily.results,
+    hourOfDay: hourOfDay.results,
     sites: sites.results,
     paths: paths.results,
     referrers: referrers.results,
@@ -353,6 +358,12 @@ const DASHBOARD_HTML = `<!doctype html>
   .bars .bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; }
   .chartrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 20px; }
   .chartrow .chart { margin-bottom: 0; }
+  .mapwrap { width: 100%; }
+  #worldMap { width: 100%; height: auto; display: block; }
+  #worldMap path { stroke: var(--panel); stroke-width: 0.5; }
+  #worldMap path.has-data { cursor: default; }
+  .maplegend { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .maplegend .swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
   .srcbar { display: flex; height: 28px; border-radius: 6px; overflow: hidden; background: var(--border); gap: 2px; }
   .srcbar .seg { min-width: 3px; }
   .srclegend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 14px; font-size: 13px; }
@@ -385,6 +396,13 @@ const DASHBOARD_HTML = `<!doctype html>
 </header>
 <main>
   <div class="cards" id="cards"></div>
+  <div class="chart">
+    <h2>Visitors by country</h2>
+    <div class="mapwrap">
+      <svg id="worldMap" viewBox="0 0 960 480" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+    <div class="maplegend" id="mapLegend"></div>
+  </div>
   <div class="chartrow">
     <div class="chart">
       <h2>Traffic sources</h2>
@@ -397,9 +415,15 @@ const DASHBOARD_HTML = `<!doctype html>
       <div class="srclegend" id="retLegend"></div>
     </div>
   </div>
-  <div class="chart">
-    <h2>Pageviews per day</h2>
-    <div class="bars" id="bars"></div>
+  <div class="chartrow">
+    <div class="chart">
+      <h2>Pageviews per day</h2>
+      <div class="bars" id="bars"></div>
+    </div>
+    <div class="chart">
+      <h2>Pageviews by hour of day</h2>
+      <div class="bars" id="hourBars"></div>
+    </div>
   </div>
   <div class="grid">
     <div class="panel"><h2>Referring sites</h2><table><tbody id="tblReferrers"></tbody></table></div>
@@ -416,6 +440,9 @@ const DASHBOARD_HTML = `<!doctype html>
   </div>
 </main>
 <script>
+var WORLD_PATHS = ${JSON.stringify(WORLD_PATHS)};
+var COUNTRY_NAMES = ${JSON.stringify(COUNTRY_NAMES)};
+
 function el(tag, cls) { var e = document.createElement(tag); if (cls) e.className = cls; return e; }
 
 var SRC_ORDER = ['Direct', 'Search', 'Social', 'Referral', 'Internal', 'Other'];
@@ -527,6 +554,80 @@ function fillBars(daily) {
   });
 }
 
+function fillHourBars(hourOfDay) {
+  var bars = document.getElementById('hourBars');
+  bars.textContent = '';
+  var byHour = {};
+  (hourOfDay || []).forEach(function (h) { byHour[h.hour] = h.views; });
+  var max = Math.max.apply(null, [1].concat((hourOfDay || []).map(function (h) { return h.views; })));
+  for (var hour = 0; hour < 24; hour++) {
+    var views = byHour[hour] || 0;
+    var b = el('div', 'bar');
+    b.style.height = Math.max(2, 100 * views / max) + '%';
+    b.title = String(hour).padStart(2, '0') + ':00–' + String(hour).padStart(2, '0') + ':59 UTC: ' + views + ' views';
+    bars.appendChild(b);
+  }
+}
+
+// Log-scaled 7-step blue ramp (dataviz skill's sequential default, light->dark).
+var MAP_RAMP = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b'];
+function colorForCount(count, maxCount) {
+  if (!count) return null;
+  if (maxCount <= 1) return MAP_RAMP[3];
+  var t = Math.log(count + 1) / Math.log(maxCount + 1);
+  var idx = Math.min(MAP_RAMP.length - 1, Math.floor(t * MAP_RAMP.length));
+  return MAP_RAMP[idx];
+}
+
+var mapBuilt = false;
+function fillMap(countries) {
+  var svg = document.getElementById('worldMap');
+  var legend = document.getElementById('mapLegend');
+  var byCountry = {};
+  var max = 1;
+  (countries || []).forEach(function (c) { byCountry[c.country] = c.views; max = Math.max(max, c.views); });
+
+  if (!mapBuilt) {
+    svg.textContent = '';
+    Object.keys(WORLD_PATHS).forEach(function (cc) {
+      var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', WORLD_PATHS[cc]);
+      path.setAttribute('data-cc', cc);
+      svg.appendChild(path);
+    });
+    mapBuilt = true;
+  }
+
+  var noData = getComputedStyle(document.documentElement).getPropertyValue('--border').trim() || '#e4e4e8';
+  var paths = svg.querySelectorAll('path[data-cc]');
+  paths.forEach(function (path) {
+    var cc = path.getAttribute('data-cc');
+    var views = byCountry[cc] || 0;
+    var color = colorForCount(views, max);
+    path.setAttribute('fill', color || noData);
+    path.classList.toggle('has-data', !!color);
+    var name = COUNTRY_NAMES[cc] || cc;
+    var titleEl = path.querySelector('title');
+    if (!titleEl) { titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title'); path.appendChild(titleEl); }
+    titleEl.textContent = views ? (name + ': ' + views + ' views') : name;
+  });
+
+  legend.textContent = '';
+  if (countries && countries.length) {
+    var lowLabel = el('span'); lowLabel.textContent = 'Fewer';
+    legend.appendChild(lowLabel);
+    MAP_RAMP.forEach(function (color) {
+      var sw = el('span', 'swatch'); sw.style.background = color;
+      legend.appendChild(sw);
+    });
+    var highLabel = el('span'); highLabel.textContent = 'More';
+    legend.appendChild(highLabel);
+  } else {
+    var empty = el('span'); empty.textContent = 'No data yet';
+    legend.appendChild(empty);
+  }
+}
+
 function fillSiteOptions(sites, current) {
   var sel = document.getElementById('siteSel');
   var keep = sel.value;
@@ -547,9 +648,11 @@ async function load() {
   if (!res.ok) return;
   var data = await res.json();
   fillCards(data.totals, data.daily.length, data.engagement, data.returning);
+  fillMap(data.countries);
   fillCategoryBar('srcBar', 'srcLegend', data.sourceBreakdown, 'category', 'views', SRC_ORDER, SRC_COLORS, 'views');
   fillCategoryBar('retBar', 'retLegend', data.returning, 'visitorType', 'visitors', RET_ORDER, RET_COLORS, 'visitors');
   fillBars(data.daily);
+  fillHourBars(data.hourOfDay);
   fillSiteOptions(data.allSites, site);
   fillTable('tblSites', data.sites, 'site', 'views');
   fillTable('tblPaths', data.paths.map(function(p){ return { label: p.site + p.path, views: p.views }; }), 'label', 'views');

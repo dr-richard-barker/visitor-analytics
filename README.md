@@ -13,14 +13,18 @@ site with no per-site configuration.
 
 ## Privacy design
 
-- No cookies, no `localStorage`, no persistent cross-visit identifier.
-- No raw IP address is ever written to the database. `visitor_hash` is
-  `sha256(ip + user-agent + calendar-day + secret salt)`, computed on the
-  edge and immediately discarded after hashing. The salt (and therefore the
-  hash) is scoped to a single calendar day, so it cannot be used to follow
-  the same person across days or correlate them with anything else. One
-  consequence: there's no "new vs. returning visitor" metric, by design —
-  that would require a persistent identifier.
+- No cookies. No raw IP address is ever written to the database.
+  `visitor_hash` is `sha256(ip + user-agent + calendar-day + secret salt)`,
+  computed on the edge and immediately discarded after hashing. The salt
+  (and therefore the hash) is scoped to a single calendar day, so it cannot
+  be used to follow the same person across days.
+- The one deliberate exception to "no persistent identifier" is `client_id`:
+  an opaque random value in `localStorage`, used *only* to look up
+  `first_seen_ts` in `visitor_first_seen` and classify a visit as New or
+  Returning for the selected date range. It carries no other data, is never
+  shown or exported on its own, and — like everything else here — clearing
+  site data, a different browser/device, or private browsing all just look
+  like a new visitor again.
 - Country/city/region come from Cloudflare's own edge geolocation
   (`request.cf`) — no IP geolocation database, no stored IP, and never
   precise coordinates (no lat/long is ever requested or stored).
@@ -58,6 +62,20 @@ site with no per-site configuration.
 - `src/worker.js` — the entire system: `/collect` (ingest), `/a.js` (client
   snippet, served with the correct absolute URL for wherever it's deployed),
   `/api/stats` (aggregated JSON, Basic-Auth gated), `/` (dashboard, same auth).
+- `src/world_map_data.js` — static SVG path data for the country choropleth,
+  generated once at dev time (not fetched at runtime — the dashboard stays
+  fully self-contained). Country outlines from
+  [`world-atlas`](https://github.com/topojson/world-atlas) (ISC license,
+  Natural Earth data at 110m resolution, itself public domain), reprojected
+  equirectangular into a 960×480 viewBox; alpha-2 codes/names from
+  [`iso-3166-1`](https://www.npmjs.com/package/iso-3166-1) (MIT). No new
+  visitor data was needed for this — it's keyed on the same `country` code
+  Cloudflare already provides. 3 disputed territories without an official
+  ISO 3166-1 numeric code (Kosovo, Somaliland, N. Cyprus) aren't shaded on
+  the map, though they'd still count in the Countries table if Cloudflare
+  ever reports them. Regenerating it means re-running the conversion script
+  (topojson → equirectangular projection → SVG path per country, joined to
+  alpha-2 by numeric code) — not something to hand-edit.
 - `schema.sql` — the one `pageviews` table (current shape, for fresh installs).
 - `migrations/` — one-time `ALTER TABLE` scripts for a database that
   predates a given feature; `schema.sql` already includes everything for a
@@ -133,12 +151,19 @@ Visit the Worker URL in a browser, enter the dashboard password when
 prompted. Filter by site or date range (7/30/90 days). The dashboard shows:
 
 - **Headline cards**: pageviews, unique visitors, avg. views/day, avg. time
-  on page, pages/session, bounce rate.
-- **Traffic sources**: a Direct/Search/Social/Referral/Internal/Other
-  breakdown (server-computed from the referrer and, if present, UTM
-  medium — see Privacy design for why it's bounded to exactly these 6).
+  on page, pages/session, bounce rate, returning rate.
+- **Visitors by country**: a world choropleth, log-scaled (a handful of
+  countries dominating shouldn't wash out everywhere else) — self-contained
+  SVG, no map tiles fetched from anywhere.
+- **Traffic sources** and **New vs. returning**: each a compact stacked bar.
+  Traffic sources is Direct/Search/Social/Referral/Internal/Other,
+  server-computed from the referrer and, if present, UTM medium — see
+  Privacy design for why it's bounded to exactly these 6.
 - **Campaigns**: only appears if you've used `?utm_source=`/`utm_medium=`/
   `utm_campaign=` tagged links.
+- **Pageviews per day** and **pageviews by hour of day** (UTC — visitors
+  span every timezone, so UTC is the only globally-consistent choice; there
+  isn't a single "local time" that would be correct for a global audience).
 - Breakdowns by top sites, top pages, referring sites, country, city,
   network/organization, language, device, browser, and OS.
 
