@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS pageviews (
   utm_medium    TEXT,                    -- ?utm_medium= query param, if present
   utm_campaign  TEXT,                    -- ?utm_campaign= query param, if present
   source_category TEXT,                  -- computed server-side: Direct | Search | Social | Internal | Referral | Other
+  referrer_site TEXT,                    -- if internal, the project (site) it came from
   city          TEXT,                    -- city from Cloudflare edge geolocation (coarse; no lat/long ever stored)
   region        TEXT,                    -- state/province from Cloudflare edge geolocation
   asn_org       TEXT,                    -- network operator name, e.g. "Comcast Cable", "Stanford University" — the network, not a person

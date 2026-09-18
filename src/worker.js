@@ -59,6 +59,8 @@ function categorizeSource(referrerHost, utmMedium) {
   if (!referrerHost) return 'Direct';
   const h = referrerHost.toLowerCase();
   if (h === 'dr-richard-barker.github.io') return 'Internal';
+  if (/(^|\.)scholar\.google\.\w+$|(^|\.)researchgate\.net$|(^|\.)orcid\.org$|(^|\.)doi\.org$|(^|\.)pubmed\.ncbi\.nlm\.nih\.gov$|(^|\.)biorxiv\.org$/.test(h))
+    return 'Scholarly';
   if (/(^|\.)google\.\w+$|(^|\.)bing\.com$|(^|\.)duckduckgo\.com$|(^|\.)search\.yahoo\.com$|(^|\.)baidu\.com$|(^|\.)yandex\.\w+$|(^|\.)ecosia\.org$/.test(h))
     return 'Search';
   if (/(^|\.)(x|twitter)\.com$|(^|\.)t\.co$|(^|\.)facebook\.com$|(^|\.)linkedin\.com$|(^|\.)reddit\.com$|(^|\.)mastodon\.\w+$|(^|\.)bsky\.app$|(^|\.)threads\.net$|(^|\.)news\.ycombinator\.com$|(^|\.)lobste\.rs$/.test(h))
@@ -133,13 +135,23 @@ function clientSnippet(origin) {
 
     var seg = location.pathname.split('/').filter(Boolean)[0] || '(root)';
     var refHost = '';
-    if (document.referrer) { try { refHost = new URL(document.referrer).hostname; } catch (e) {} }
+    var refSite = '';
+    if (document.referrer) { 
+      try { 
+        var ru = new URL(document.referrer);
+        refHost = ru.hostname; 
+        if (refHost === location.hostname) {
+          refSite = ru.pathname.split('/').filter(Boolean)[0] || '(root)';
+        }
+      } catch (e) {} 
+    }
     var q = new URLSearchParams(location.search);
     send({
       site: seg,
       path: location.pathname,
       t: document.title ? document.title.slice(0, 120) : '',
       ref: refHost,
+      refs: refSite,
       lang: (navigator.language || '').slice(0, 5),
       us: q.get('utm_source') || '',
       um: q.get('utm_medium') || '',
@@ -197,6 +209,7 @@ async function handleCollect(request, env, ctx) {
   const path = String(body.path || '/').slice(0, 512);
   const title = body.t ? String(body.t).slice(0, 120) : null;
   const referrerHost = body.ref ? String(body.ref).slice(0, 255) : '';
+  const referrerSite = body.refs ? String(body.refs).slice(0, 255) : null;
   const lang = body.lang ? String(body.lang).slice(0, 5) : null;
   const utmSource = body.us ? String(body.us).slice(0, 100) : null;
   const utmMedium = body.um ? String(body.um).slice(0, 100) : null;
@@ -207,7 +220,7 @@ async function handleCollect(request, env, ctx) {
 
   const { device, browser, os } = parseUA(ua);
   const cf = request.cf || {};
-  const country = cf.country || 'XX';
+  const country = cf.country || null;
   const city = cf.city || null;
   const region = cf.region || null;
   const asnOrg = cf.asOrganization || null;
@@ -217,10 +230,10 @@ async function handleCollect(request, env, ctx) {
 
   ctx.waitUntil(
     env.DB.prepare(
-      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash, utm_source, utm_medium, utm_campaign, source_category, city, region, asn_org, pageview_id, session_id, client_id)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash, utm_source, utm_medium, utm_campaign, source_category, referrer_site, city, region, asn_org, pageview_id, session_id, client_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     )
-      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash, utmSource, utmMedium, utmCampaign, sourceCategory, city, region, asnOrg, pageviewId, sessionId, clientId)
+      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash, utmSource, utmMedium, utmCampaign, sourceCategory, referrerSite, city, region, asnOrg, pageviewId, sessionId, clientId)
       .run()
   );
 
@@ -260,7 +273,7 @@ async function handleStats(request, env) {
 
   const [
     totals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries,
-    cities, networks, languages, devices, browsers, oses, engagement, hourOfDay, returning, allSites,
+    cities, networks, languages, devices, browsers, oses, engagement, hourOfDay, returning, internalFlow, allSites,
   ] = await env.DB.batch([
     q(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors, AVG(duration_sec) AS avgDuration FROM pageviews ${where}`),
     q(`SELECT CAST(ts/86400000 AS INTEGER) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors
@@ -291,6 +304,9 @@ async function handleStats(request, env) {
     q(`SELECT CAST(strftime('%H', ts/1000, 'unixepoch') AS INTEGER) AS hour, COUNT(*) AS views
        FROM pageviews ${where} GROUP BY hour ORDER BY hour`),
     returningQuery,
+    q(`SELECT referrer_site AS from_site, site AS to_site, COUNT(*) AS transitions
+       FROM pageviews ${where} AND source_category = 'Internal' AND referrer_site IS NOT NULL AND referrer_site != '' AND referrer_site != site
+       GROUP BY from_site, to_site ORDER BY transitions DESC LIMIT 15`),
     env.DB.prepare(`SELECT DISTINCT site FROM pageviews ORDER BY site`),
   ]);
 
@@ -304,6 +320,7 @@ async function handleStats(request, env) {
     paths: paths.results,
     referrers: referrers.results,
     sourceBreakdown: sourceBreakdown.results,
+    internalFlow: internalFlow.results,
     returning: returning.results,
     campaigns: campaigns.results,
     countries: countries.results,
@@ -329,18 +346,16 @@ const DASHBOARD_HTML = `<!doctype html>
 <style>
   :root {
     color-scheme: light dark;
-    --bg: #f7f7f8; --panel: #ffffff; --text: #1a1a1e; --muted: #6b6b76;
-    --border: #e4e4e8; --accent: #4f46e5; --bar: #c7c2fb;
-    /* Categorical palette (validated: fixed hue order, CVD-safe adjacent pairs) */
+    --bg: #fafafa; --panel: #fff; --text: #1a1a1e; --muted: #6b6b76; --border: #e2e2e8; --accent: #6554c0; --bar: #e8e8f0;
     --src-direct: #2a78d6; --src-search: #eb6834; --src-social: #1baf7a;
-    --src-referral: #eda100; --src-internal: #e87ba4; --src-other: #008300;
+    --src-referral: #eda100; --src-internal: #e87ba4; --src-scholarly: #9b59b6; --src-other: #008300;
     --ret-new: #4a3aa7; --ret-returning: #e34948;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #16161a; --panel: #1f1f24; --text: #f0f0f2; --muted: #9a9aa4; --border: #2e2e35; --accent: #8b7ffb; --bar: #3a3560;
       --src-direct: #3987e5; --src-search: #d95926; --src-social: #199e70;
-      --src-referral: #c98500; --src-internal: #d55181; --src-other: #008300;
+      --src-referral: #c98500; --src-internal: #d55181; --src-scholarly: #8e44ad; --src-other: #008300;
       --ret-new: #9085e9; --ret-returning: #e66767;
     }
   }
@@ -455,6 +470,7 @@ const DASHBOARD_HTML = `<!doctype html>
   </div>
   <div class="grid">
     <div class="panel"><h2>Referring sites</h2><table><tbody id="tblReferrers"></tbody></table></div>
+    <div class="panel"><h2>Internal flow (Project &rarr; Project)</h2><table><tbody id="tblInternalFlow"></tbody></table></div>
     <div class="panel" id="panelCampaigns" hidden><h2>Campaigns</h2><table><tbody id="tblCampaigns"></tbody></table></div>
     <div class="panel"><h2>Top sites</h2><table><tbody id="tblSites"></tbody></table></div>
     <div class="panel"><h2>Top pages</h2><table><tbody id="tblPaths"></tbody></table></div>
@@ -473,10 +489,10 @@ var COUNTRY_NAMES = ${JSON.stringify(COUNTRY_NAMES)};
 
 function el(tag, cls) { var e = document.createElement(tag); if (cls) e.className = cls; return e; }
 
-var SRC_ORDER = ['Direct', 'Search', 'Social', 'Referral', 'Internal', 'Other'];
+var SRC_ORDER = ['Direct', 'Search', 'Social', 'Scholarly', 'Referral', 'Internal', 'Other'];
 var SRC_COLORS = {
   Direct: 'var(--src-direct)', Search: 'var(--src-search)', Social: 'var(--src-social)',
-  Referral: 'var(--src-referral)', Internal: 'var(--src-internal)', Other: 'var(--src-other)'
+  Scholarly: 'var(--src-scholarly)', Referral: 'var(--src-referral)', Internal: 'var(--src-internal)', Other: 'var(--src-other)'
 };
 var RET_ORDER = ['New', 'Returning'];
 var RET_COLORS = { New: 'var(--ret-new)', Returning: 'var(--ret-returning)' };
@@ -782,6 +798,9 @@ async function load() {
   fillTable('tblSites', data.sites, 'site', 'views');
   fillTable('tblPaths', data.paths.map(function(p){ return { label: p.site + p.path, views: p.views }; }), 'label', 'views');
   fillTable('tblReferrers', data.referrers, 'referrer_host', 'views');
+  fillTable('tblInternalFlow', (data.internalFlow || []).map(function(f) {
+    return { label: f.from_site + ' → ' + f.to_site, views: f.transitions };
+  }), 'label', 'views');
   document.getElementById('panelCampaigns').hidden = !(data.campaigns && data.campaigns.length);
   fillTable('tblCampaigns', (data.campaigns || []).map(function (c) {
     var label = c.utm_source + (c.utm_campaign ? ' / ' + c.utm_campaign : '') + (c.utm_medium ? ' (' + c.utm_medium + ')' : '');
