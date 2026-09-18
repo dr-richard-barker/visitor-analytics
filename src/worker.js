@@ -254,28 +254,44 @@ async function handleStats(request, env) {
   const url = new URL(request.url);
   const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '30', 10) || 30, 1), 365);
   const site = url.searchParams.get('site') || null;
+  const country = url.searchParams.get('country') || null;
   const since = Date.now() - days * 86400000;
+  const prevSince = since - days * 86400000;
 
-  const where = site ? 'WHERE ts >= ? AND site = ?' : 'WHERE ts >= ?';
-  const params = site ? [since, site] : [since];
+  // Both filters build off the same clause list so site + country can combine
+  // if ever needed; `filterSqlP`/`filterParamsP` is the p.-prefixed variant
+  // for the one query that joins against visitor_first_seen as "p".
+  const filterClauses = [];
+  const filterParams = [];
+  if (site) { filterClauses.push('site = ?'); filterParams.push(site); }
+  if (country) { filterClauses.push('country = ?'); filterParams.push(country); }
+  const filterSql = filterClauses.length ? ' AND ' + filterClauses.join(' AND ') : '';
+  const filterSqlP = filterClauses.length ? ' AND ' + filterClauses.map((c) => 'p.' + c).join(' AND ') : '';
+
+  const where = `WHERE ts >= ?${filterSql}`;
+  const params = [since, ...filterParams];
   const q = (sql) => env.DB.prepare(sql).bind(...params);
+
+  const prevWhere = `WHERE ts >= ? AND ts < ?${filterSql}`;
+  const prevParams = [prevSince, since, ...filterParams];
+  const pq = (sql) => env.DB.prepare(sql).bind(...prevParams);
 
   // first_seen_ts >= since => their first-ever visit falls in this window (New);
   // otherwise they already existed before it (Returning). since appears twice.
-  const returningParams = site ? [since, since, site] : [since, since];
   const returningQuery = env.DB.prepare(
     `SELECT CASE WHEN vfs.first_seen_ts >= ? THEN 'New' ELSE 'Returning' END AS visitorType,
             COUNT(DISTINCT p.client_id) AS visitors
      FROM pageviews p JOIN visitor_first_seen vfs ON vfs.client_id = p.client_id
-     WHERE p.ts >= ? ${site ? 'AND p.site = ?' : ''} AND p.client_id IS NOT NULL AND p.client_id != ''
+     WHERE p.ts >= ?${filterSqlP} AND p.client_id IS NOT NULL AND p.client_id != ''
      GROUP BY visitorType`
-  ).bind(...returningParams);
+  ).bind(since, since, ...filterParams);
 
   const [
-    totals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries,
-    cities, networks, languages, devices, browsers, oses, engagement, hourOfDay, returning, internalFlow, allSites,
+    totals, prevTotals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries,
+    cities, networks, languages, devices, browsers, oses, engagement, prevEngagement, hourOfDay, returning, internalFlow, allSites,
   ] = await env.DB.batch([
     q(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors, AVG(duration_sec) AS avgDuration FROM pageviews ${where}`),
+    pq(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors, AVG(duration_sec) AS avgDuration FROM pageviews ${prevWhere}`),
     q(`SELECT CAST(ts/86400000 AS INTEGER) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors
        FROM pageviews ${where} GROUP BY day ORDER BY day`),
     q(`SELECT site, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors FROM pageviews ${where} GROUP BY site ORDER BY views DESC LIMIT 20`),
@@ -301,6 +317,10 @@ async function handleStats(request, env) {
               100.0 * SUM(CASE WHEN cnt = 1 THEN 1 ELSE 0 END) / COUNT(*) AS bounceRatePct
        FROM (SELECT session_id, COUNT(*) AS cnt FROM pageviews ${where}
              AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id)`),
+    pq(`SELECT AVG(cnt) AS avgPagesPerSession, COUNT(*) AS sessionCount,
+              100.0 * SUM(CASE WHEN cnt = 1 THEN 1 ELSE 0 END) / COUNT(*) AS bounceRatePct
+       FROM (SELECT session_id, COUNT(*) AS cnt FROM pageviews ${prevWhere}
+             AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id)`),
     q(`SELECT CAST(strftime('%H', ts/1000, 'unixepoch') AS INTEGER) AS hour, COUNT(*) AS views
        FROM pageviews ${where} GROUP BY hour ORDER BY hour`),
     returningQuery,
@@ -313,7 +333,9 @@ async function handleStats(request, env) {
   const body = {
     days,
     site,
+    country,
     totals: totals.results[0] || { views: 0, visitors: 0, avgDuration: 0 },
+    prevTotals: prevTotals.results[0] || { views: 0, visitors: 0, avgDuration: 0 },
     daily: daily.results,
     hourOfDay: hourOfDay.results,
     sites: sites.results,
@@ -331,6 +353,7 @@ async function handleStats(request, env) {
     browsers: browsers.results,
     oses: oses.results,
     engagement: engagement.results[0] || { avgPagesPerSession: 0, sessionCount: 0, bounceRatePct: 0 },
+    prevEngagement: prevEngagement.results[0] || { avgPagesPerSession: 0, sessionCount: 0, bounceRatePct: 0 },
     allSites: allSites.results.map((r) => r.site),
   };
 
@@ -348,14 +371,16 @@ const DASHBOARD_HTML = `<!doctype html>
     color-scheme: light dark;
     --bg: #fafafa; --panel: #fff; --text: #1a1a1e; --muted: #6b6b76; --border: #e2e2e8; --accent: #6554c0; --bar: #e8e8f0;
     --src-direct: #2a78d6; --src-search: #eb6834; --src-social: #1baf7a;
-    --src-referral: #eda100; --src-internal: #e87ba4; --src-scholarly: #9b59b6; --src-other: #008300;
+    --src-referral: #eda100; --src-internal: #e87ba4; --src-other: #008300; --src-scholarly: #4a3aa7;
     --ret-new: #4a3aa7; --ret-returning: #e34948;
+    --delta-good: #006300; --delta-bad: #d03b3b;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #16161a; --panel: #1f1f24; --text: #f0f0f2; --muted: #9a9aa4; --border: #2e2e35; --accent: #8b7ffb; --bar: #3a3560;
       --src-direct: #3987e5; --src-search: #d95926; --src-social: #199e70;
-      --src-referral: #c98500; --src-internal: #d55181; --src-scholarly: #8e44ad; --src-other: #008300;
+      --src-referral: #c98500; --src-internal: #d55181; --src-other: #008300; --src-scholarly: #9085e9;
+      --delta-good: #0ca30c; --delta-bad: #d03b3b;
       --ret-new: #9085e9; --ret-returning: #e66767;
     }
   }
@@ -365,11 +390,18 @@ const DASHBOARD_HTML = `<!doctype html>
   h1 { font-size: 18px; margin: 0; }
   .controls { display: flex; gap: 8px; }
   select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  .filterchip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer; font-family: inherit; }
+  .filterchip:hover { background: var(--bar); }
+  #countryFilterChip { border-color: var(--accent); color: var(--accent); }
   main { padding: 24px; max-width: 1100px; margin: 0 auto; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
   .card .num { font-size: 24px; font-weight: 600; }
   .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .delta { font-size: 11px; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .card .delta.delta-good { color: var(--delta-good); }
+  .card .delta.delta-bad { color: var(--delta-bad); }
+  .card .delta.delta-flat, .card .delta.delta-new { color: var(--muted); }
   .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
   .chart h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .barchart { display: flex; gap: 8px; }
@@ -386,6 +418,7 @@ const DASHBOARD_HTML = `<!doctype html>
   #worldMap path { stroke: var(--panel); stroke-width: 0.5; transition: filter .1s; }
   #worldMap path.has-data { cursor: pointer; }
   #worldMap path.hovered { filter: brightness(1.25); stroke: var(--text); stroke-width: 1; }
+  #worldMap path.selected { stroke: var(--accent); stroke-width: 2; }
   .maplegend { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 12px; font-size: 12px; color: var(--muted); }
   .maplegend .swatch { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
   .maptip { position: absolute; z-index: 10; pointer-events: none; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18); min-width: 150px; }
@@ -416,12 +449,14 @@ const DASHBOARD_HTML = `<!doctype html>
 <header>
   <h1>Visitor Analytics</h1>
   <div class="controls">
+    <button id="countryFilterChip" class="filterchip" hidden></button>
     <select id="siteSel"><option value="">All sites</option></select>
     <select id="daysSel">
       <option value="7">Last 7 days</option>
       <option value="30" selected>Last 30 days</option>
       <option value="90">Last 90 days</option>
     </select>
+    <button id="exportCsvBtn" class="filterchip" type="button">Export CSV</button>
   </div>
 </header>
 <main>
@@ -489,10 +524,14 @@ var COUNTRY_NAMES = ${JSON.stringify(COUNTRY_NAMES)};
 
 function el(tag, cls) { var e = document.createElement(tag); if (cls) e.className = cls; return e; }
 
-var SRC_ORDER = ['Direct', 'Search', 'Social', 'Scholarly', 'Referral', 'Internal', 'Other'];
+// Scholarly deliberately sits LAST: it's the newest category, and the
+// dataviz skill's fixed-order rule means a new series always takes the next
+// slot rather than being inserted mid-sequence — only then is its adjacency
+// to its neighbor guaranteed to be one of the palette's validated pairs.
+var SRC_ORDER = ['Direct', 'Search', 'Social', 'Referral', 'Internal', 'Other', 'Scholarly'];
 var SRC_COLORS = {
   Direct: 'var(--src-direct)', Search: 'var(--src-search)', Social: 'var(--src-social)',
-  Scholarly: 'var(--src-scholarly)', Referral: 'var(--src-referral)', Internal: 'var(--src-internal)', Other: 'var(--src-other)'
+  Referral: 'var(--src-referral)', Internal: 'var(--src-internal)', Other: 'var(--src-other)', Scholarly: 'var(--src-scholarly)'
 };
 var RET_ORDER = ['New', 'Returning'];
 var RET_COLORS = { New: 'var(--ret-new)', Returning: 'var(--ret-returning)' };
@@ -557,7 +596,30 @@ function formatDuration(sec) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
-function fillCards(totals, dayCount, engagement, returning) {
+// vs the immediately preceding period of the same length. null prev (no
+// prior data at all) reads as "new" rather than a misleading +infinity%.
+function computeDelta(curr, prev) {
+  if (!prev) return curr > 0 ? { dir: 'new' } : null;
+  var pct = ((curr - prev) / prev) * 100;
+  return { pct: pct, dir: pct > 0.5 ? 'up' : pct < -0.5 ? 'down' : 'flat' };
+}
+
+function fillDeltaEl(container, delta, upIsGood) {
+  if (!delta) return;
+  var chip = el('div', 'delta');
+  if (delta.dir === 'new') {
+    chip.textContent = 'new'; chip.classList.add('delta-new');
+  } else if (delta.dir === 'flat') {
+    chip.textContent = '±0%'; chip.classList.add('delta-flat');
+  } else {
+    var favorable = (delta.dir === 'up') === upIsGood;
+    chip.classList.add(favorable ? 'delta-good' : 'delta-bad');
+    chip.textContent = (delta.dir === 'up' ? '▲ ' : '▼ ') + Math.abs(Math.round(delta.pct)) + '%';
+  }
+  container.appendChild(chip);
+}
+
+function fillCards(totals, prevTotals, dayCount, engagement, prevEngagement, returning) {
   var cards = document.getElementById('cards');
   cards.textContent = '';
   var newCount = 0, returningCount = 0;
@@ -567,19 +629,20 @@ function fillCards(totals, dayCount, engagement, returning) {
   var knownVisitors = newCount + returningCount;
   var returningRate = knownVisitors ? Math.round(100 * returningCount / knownVisitors) + '%' : '—';
   var items = [
-    ['Pageviews', totals.views],
-    ['Unique visitors', totals.visitors],
-    ['Avg. views / day', dayCount ? Math.round(totals.views / dayCount) : 0],
-    ['Avg. time on page', formatDuration(totals.avgDuration)],
-    ['Pages / session', (engagement.avgPagesPerSession || 0).toFixed(1)],
-    ['Bounce rate', Math.round(engagement.bounceRatePct || 0) + '%'],
-    ['Returning rate', returningRate]
+    { label: 'Pageviews', display: totals.views, delta: computeDelta(totals.views, prevTotals.views), upGood: true },
+    { label: 'Unique visitors', display: totals.visitors, delta: computeDelta(totals.visitors, prevTotals.visitors), upGood: true },
+    { label: 'Avg. views / day', display: dayCount ? Math.round(totals.views / dayCount) : 0 },
+    { label: 'Avg. time on page', display: formatDuration(totals.avgDuration), delta: computeDelta(totals.avgDuration, prevTotals.avgDuration), upGood: true },
+    { label: 'Pages / session', display: (engagement.avgPagesPerSession || 0).toFixed(1) },
+    { label: 'Bounce rate', display: Math.round(engagement.bounceRatePct || 0) + '%', delta: computeDelta(engagement.bounceRatePct, prevEngagement.bounceRatePct), upGood: false },
+    { label: 'Returning rate', display: returningRate }
   ];
-  items.forEach(function (pair) {
+  items.forEach(function (item) {
     var card = el('div', 'card');
-    var num = el('div', 'num'); num.textContent = pair[1];
-    var label = el('div', 'label'); label.textContent = pair[0];
+    var num = el('div', 'num'); num.textContent = item.display;
+    var label = el('div', 'label'); label.textContent = item.label;
     card.appendChild(num); card.appendChild(label);
+    fillDeltaEl(card, item.delta, item.upGood);
     cards.appendChild(card);
   });
 }
@@ -669,6 +732,22 @@ var mapBuilt = false;
 // including after the date-range/site filters change.
 var mapCountryStats = {};
 var mapTopCity = {};
+var selectedCountry = '';
+
+function updateCountryChip() {
+  var chip = document.getElementById('countryFilterChip');
+  chip.textContent = '';
+  if (!selectedCountry) { chip.hidden = true; return; }
+  chip.hidden = false;
+  var name = el('span'); name.textContent = COUNTRY_NAMES[selectedCountry] || selectedCountry;
+  var x = el('span'); x.textContent = ' ✕';
+  chip.appendChild(name); chip.appendChild(x);
+}
+document.getElementById('countryFilterChip').addEventListener('click', function () {
+  selectedCountry = '';
+  updateCountryChip();
+  load();
+});
 
 // The map is a pointer/touch-enhanced supplement, not a keyboard tab-stop:
 // 174 individual tab stops would hurt keyboard users far more than it helps,
@@ -738,6 +817,12 @@ function fillMap(countries, cities) {
       path.addEventListener('pointerenter', function (evt) { path.classList.add('hovered'); showMapTip(evt, cc); });
       path.addEventListener('pointermove', positionMapTip);
       path.addEventListener('pointerleave', function () { path.classList.remove('hovered'); hideMapTip(); });
+      path.addEventListener('click', function () {
+        if (!mapCountryStats[cc]) return; // nothing to filter to
+        selectedCountry = selectedCountry === cc ? '' : cc;
+        updateCountryChip();
+        load();
+      });
       svg.appendChild(path);
     });
     mapBuilt = true;
@@ -751,6 +836,7 @@ function fillMap(countries, cities) {
     var color = colorForCount(views, max);
     path.setAttribute('fill', color || noData);
     path.classList.toggle('has-data', !!color);
+    path.classList.toggle('selected', cc === selectedCountry);
   });
 
   legend.textContent = '';
@@ -781,14 +867,91 @@ function fillSiteOptions(sites, current) {
   sel.value = current || keep || '';
 }
 
+// DASHBOARD_HTML (the file this lives in) is itself one giant template
+// literal, so a literal backslash-n escape in this SOURCE gets consumed as
+// a real newline by the outer template literal before this code ever
+// reaches the browser — same failure class as the backtick bug elsewhere in
+// this file, just via escape sequences instead. String.fromCharCode
+// sidesteps it entirely: no backslash of any kind appears in this file's
+// own source, inside DASHBOARD_HTML, ever — not in code, not in a comment.
+var NL = String.fromCharCode(10);
+
+function csvEscape(val) {
+  var s = (val === null || val === undefined) ? '' : String(val);
+  var needsQuoting = s.indexOf('"') !== -1 || s.indexOf(',') !== -1 || s.indexOf(NL) !== -1;
+  return needsQuoting ? '"' + s.split('"').join('""') + '"' : s;
+}
+
+function csvSection(title, rows, columns) {
+  var lines = ['# ' + title, columns.map(function (c) { return csvEscape(c.header); }).join(',')];
+  (rows || []).forEach(function (r) {
+    lines.push(columns.map(function (c) { return csvEscape(typeof c.get === 'function' ? c.get(r) : r[c.key]); }).join(','));
+  });
+  return lines.join(NL);
+}
+
+// Exports exactly what's currently on screen (same filters, same fetched
+// payload) rather than a separate server-side export path that could drift.
+function buildCsv(data) {
+  var sections = [];
+  sections.push(csvSection('Summary', [
+    { metric: 'Pageviews', value: data.totals.views },
+    { metric: 'Unique visitors', value: data.totals.visitors },
+    { metric: 'Avg time on page (sec)', value: Math.round(data.totals.avgDuration || 0) },
+    { metric: 'Bounce rate (%)', value: Math.round(data.engagement.bounceRatePct || 0) },
+    { metric: 'Pages per session', value: (data.engagement.avgPagesPerSession || 0).toFixed(2) },
+  ], [{ key: 'metric', header: 'Metric' }, { key: 'value', header: 'Value' }]));
+  sections.push(csvSection('Daily', data.daily.map(function (d) {
+    return { date: new Date(d.day * 86400000).toISOString().slice(0, 10), views: d.views, visitors: d.visitors };
+  }), [{ key: 'date', header: 'Date' }, { key: 'views', header: 'Views' }, { key: 'visitors', header: 'Visitors' }]));
+  sections.push(csvSection('Traffic sources', data.sourceBreakdown, [{ key: 'category', header: 'Category' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('New vs returning', data.returning, [{ key: 'visitorType', header: 'Type' }, { key: 'visitors', header: 'Visitors' }]));
+  sections.push(csvSection('Countries', data.countries, [{ key: 'country', header: 'Country' }, { key: 'views', header: 'Views' }, { key: 'visitors', header: 'Visitors' }]));
+  sections.push(csvSection('Cities', data.cities, [{ key: 'city', header: 'City' }, { key: 'country', header: 'Country' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('Networks', data.networks, [{ key: 'asn_org', header: 'Network' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('Languages', data.languages, [{ key: 'lang', header: 'Language' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('Devices', data.devices, [{ key: 'device', header: 'Device' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('Browsers', data.browsers, [{ key: 'browser', header: 'Browser' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('Operating systems', data.oses, [{ key: 'os', header: 'OS' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('Referring sites', data.referrers, [{ key: 'referrer_host', header: 'Referrer' }, { key: 'views', header: 'Views' }]));
+  sections.push(csvSection('Internal flow', data.internalFlow, [{ key: 'from_site', header: 'From' }, { key: 'to_site', header: 'To' }, { key: 'transitions', header: 'Transitions' }]));
+  sections.push(csvSection('Top sites', data.sites, [{ key: 'site', header: 'Site' }, { key: 'views', header: 'Views' }, { key: 'visitors', header: 'Visitors' }]));
+  sections.push(csvSection('Top pages', data.paths, [{ key: 'site', header: 'Site' }, { key: 'path', header: 'Path' }, { key: 'views', header: 'Views' }]));
+  if (data.campaigns && data.campaigns.length) {
+    sections.push(csvSection('Campaigns', data.campaigns, [{ key: 'utm_source', header: 'Source' }, { key: 'utm_campaign', header: 'Campaign' }, { key: 'utm_medium', header: 'Medium' }, { key: 'views', header: 'Views' }]));
+  }
+  return sections.join(NL + NL);
+}
+
+function downloadCsv() {
+  if (!lastData) return;
+  var csv = buildCsv(lastData);
+  var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  var days = document.getElementById('daysSel').value;
+  var site = document.getElementById('siteSel').value || 'all-sites';
+  a.download = 'visitor-analytics_' + site + '_' + days + 'd_' + new Date().toISOString().slice(0, 10) + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+document.getElementById('exportCsvBtn').addEventListener('click', downloadCsv);
+
+var lastData = null;
+
 async function load() {
   var days = document.getElementById('daysSel').value;
   var site = document.getElementById('siteSel').value;
-  var qs = 'days=' + encodeURIComponent(days) + (site ? '&site=' + encodeURIComponent(site) : '');
+  var qs = 'days=' + encodeURIComponent(days) + (site ? '&site=' + encodeURIComponent(site) : '') +
+    (selectedCountry ? '&country=' + encodeURIComponent(selectedCountry) : '');
   var res = await fetch('/api/stats?' + qs);
   if (!res.ok) return;
   var data = await res.json();
-  fillCards(data.totals, data.daily.length, data.engagement, data.returning);
+  lastData = data;
+  fillCards(data.totals, data.prevTotals, data.daily.length, data.engagement, data.prevEngagement, data.returning);
   fillMap(data.countries, data.cities);
   fillCategoryBar('srcBar', 'srcLegend', data.sourceBreakdown, 'category', 'views', SRC_ORDER, SRC_COLORS, 'views');
   fillCategoryBar('retBar', 'retLegend', data.returning, 'visitorType', 'visitors', RET_ORDER, RET_COLORS, 'visitors');
