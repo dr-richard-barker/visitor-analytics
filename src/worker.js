@@ -5,10 +5,12 @@
 //   GET  /api/stats    -> aggregated JSON, Basic-Auth gated
 //   GET  /, /dashboard -> dashboard UI, Basic-Auth gated
 //
-// Privacy: no cookies, no persistent client-side ID, no raw IP stored.
-// "Unique visitors" is approximated with a salted hash of (IP + UA + calendar day),
-// computed on the edge and discarded immediately after hashing; the salt rotates
-// daily so the hash cannot be used to follow anyone across days.
+// Privacy: no cookies, no raw IP stored. "Unique visitors" is approximated
+// with a salted hash of (IP + UA + calendar day), computed on the edge and
+// discarded immediately after hashing; the salt rotates daily so the hash
+// cannot be used to follow anyone across days. The one deliberate exception
+// is `client_id` (localStorage, opaque random value) used only to classify
+// new vs. returning visitors — see clientSnippet() and visitor_first_seen.
 
 function parseUA(ua) {
   ua = ua || '';
@@ -116,6 +118,17 @@ function clientSnippet(origin) {
       if (!sid) { sid = rid(); sessionStorage.setItem('va_sid', sid); }
     } catch (e) {}
 
+    // Opaque, persistent, single-purpose: the only piece of state here that
+    // survives closing the browser. It carries nothing but a random value —
+    // used only to tell new visits from returning ones. Cleared by clearing
+    // site data, a different browser/device, or private browsing all just
+    // look like a new visitor again, which is the expected trade-off.
+    var cid = '';
+    try {
+      cid = localStorage.getItem('va_cid') || '';
+      if (!cid) { cid = (crypto && crypto.randomUUID) ? crypto.randomUUID() : rid(); localStorage.setItem('va_cid', cid); }
+    } catch (e) {}
+
     var seg = location.pathname.split('/').filter(Boolean)[0] || '(root)';
     var refHost = '';
     if (document.referrer) { try { refHost = new URL(document.referrer).hostname; } catch (e) {} }
@@ -130,7 +143,8 @@ function clientSnippet(origin) {
       um: q.get('utm_medium') || '',
       uc: q.get('utm_campaign') || '',
       pid: pid,
-      sid: sid
+      sid: sid,
+      cid: cid
     });
 
     // Engaged-time heartbeat: only while the tab is actually visible, capped
@@ -187,6 +201,7 @@ async function handleCollect(request, env, ctx) {
   const utmCampaign = body.uc ? String(body.uc).slice(0, 100) : null;
   const pageviewId = body.pid ? String(body.pid).slice(0, 64) : null;
   const sessionId = body.sid ? String(body.sid).slice(0, 64) : null;
+  const clientId = body.cid ? String(body.cid).slice(0, 64) : null;
 
   const { device, browser, os } = parseUA(ua);
   const cf = request.cf || {};
@@ -200,12 +215,22 @@ async function handleCollect(request, env, ctx) {
 
   ctx.waitUntil(
     env.DB.prepare(
-      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash, utm_source, utm_medium, utm_campaign, source_category, city, region, asn_org, pageview_id, session_id)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO pageviews (ts, site, path, title, referrer_host, country, device, browser, os, lang, visitor_hash, utm_source, utm_medium, utm_campaign, source_category, city, region, asn_org, pageview_id, session_id, client_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     )
-      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash, utmSource, utmMedium, utmCampaign, sourceCategory, city, region, asnOrg, pageviewId, sessionId)
+      .bind(Date.now(), site, path, title, referrerHost, country, device, browser, os, lang, visitorHash, utmSource, utmMedium, utmCampaign, sourceCategory, city, region, asnOrg, pageviewId, sessionId, clientId)
       .run()
   );
+
+  if (clientId) {
+    ctx.waitUntil(
+      env.DB.prepare(
+        `INSERT INTO visitor_first_seen (client_id, first_seen_ts) VALUES (?, ?) ON CONFLICT(client_id) DO NOTHING`
+      )
+        .bind(clientId, Date.now())
+        .run()
+    );
+  }
 
   return new Response(null, { status: 204, headers: corsHeaders });
 }
@@ -220,9 +245,20 @@ async function handleStats(request, env) {
   const params = site ? [since, site] : [since];
   const q = (sql) => env.DB.prepare(sql).bind(...params);
 
+  // first_seen_ts >= since => their first-ever visit falls in this window (New);
+  // otherwise they already existed before it (Returning). since appears twice.
+  const returningParams = site ? [since, since, site] : [since, since];
+  const returningQuery = env.DB.prepare(
+    `SELECT CASE WHEN vfs.first_seen_ts >= ? THEN 'New' ELSE 'Returning' END AS visitorType,
+            COUNT(DISTINCT p.client_id) AS visitors
+     FROM pageviews p JOIN visitor_first_seen vfs ON vfs.client_id = p.client_id
+     WHERE p.ts >= ? ${site ? 'AND p.site = ?' : ''} AND p.client_id IS NOT NULL AND p.client_id != ''
+     GROUP BY visitorType`
+  ).bind(...returningParams);
+
   const [
     totals, daily, sites, paths, referrers, sourceBreakdown, campaigns, countries,
-    cities, networks, languages, devices, browsers, oses, engagement, allSites,
+    cities, networks, languages, devices, browsers, oses, engagement, returning, allSites,
   ] = await env.DB.batch([
     q(`SELECT COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors, AVG(duration_sec) AS avgDuration FROM pageviews ${where}`),
     q(`SELECT CAST(ts/86400000 AS INTEGER) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_hash) AS visitors
@@ -247,6 +283,7 @@ async function handleStats(request, env) {
               100.0 * SUM(CASE WHEN cnt = 1 THEN 1 ELSE 0 END) / COUNT(*) AS bounceRatePct
        FROM (SELECT session_id, COUNT(*) AS cnt FROM pageviews ${where}
              AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id)`),
+    returningQuery,
     env.DB.prepare(`SELECT DISTINCT site FROM pageviews ORDER BY site`),
   ]);
 
@@ -259,6 +296,7 @@ async function handleStats(request, env) {
     paths: paths.results,
     referrers: referrers.results,
     sourceBreakdown: sourceBreakdown.results,
+    returning: returning.results,
     campaigns: campaigns.results,
     countries: countries.results,
     cities: cities.results,
@@ -288,12 +326,14 @@ const DASHBOARD_HTML = `<!doctype html>
     /* Categorical palette (validated: fixed hue order, CVD-safe adjacent pairs) */
     --src-direct: #2a78d6; --src-search: #eb6834; --src-social: #1baf7a;
     --src-referral: #eda100; --src-internal: #e87ba4; --src-other: #008300;
+    --ret-new: #4a3aa7; --ret-returning: #e34948;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #16161a; --panel: #1f1f24; --text: #f0f0f2; --muted: #9a9aa4; --border: #2e2e35; --accent: #8b7ffb; --bar: #3a3560;
       --src-direct: #3987e5; --src-search: #d95926; --src-social: #199e70;
       --src-referral: #c98500; --src-internal: #d55181; --src-other: #008300;
+      --ret-new: #9085e9; --ret-returning: #e66767;
     }
   }
   * { box-sizing: border-box; }
@@ -311,6 +351,8 @@ const DASHBOARD_HTML = `<!doctype html>
   .chart h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .bars { display: flex; align-items: flex-end; gap: 2px; height: 100px; }
   .bars .bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; }
+  .chartrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .chartrow .chart { margin-bottom: 0; }
   .srcbar { display: flex; height: 28px; border-radius: 6px; overflow: hidden; background: var(--border); gap: 2px; }
   .srcbar .seg { min-width: 3px; }
   .srclegend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 14px; font-size: 13px; }
@@ -343,10 +385,17 @@ const DASHBOARD_HTML = `<!doctype html>
 </header>
 <main>
   <div class="cards" id="cards"></div>
-  <div class="chart">
-    <h2>Traffic sources</h2>
-    <div class="srcbar" id="srcBar"></div>
-    <div class="srclegend" id="srcLegend"></div>
+  <div class="chartrow">
+    <div class="chart">
+      <h2>Traffic sources</h2>
+      <div class="srcbar" id="srcBar"></div>
+      <div class="srclegend" id="srcLegend"></div>
+    </div>
+    <div class="chart">
+      <h2>New vs. returning</h2>
+      <div class="srcbar" id="retBar"></div>
+      <div class="srclegend" id="retLegend"></div>
+    </div>
   </div>
   <div class="chart">
     <h2>Pageviews per day</h2>
@@ -374,34 +423,38 @@ var SRC_COLORS = {
   Direct: 'var(--src-direct)', Search: 'var(--src-search)', Social: 'var(--src-social)',
   Referral: 'var(--src-referral)', Internal: 'var(--src-internal)', Other: 'var(--src-other)'
 };
+var RET_ORDER = ['New', 'Returning'];
+var RET_COLORS = { New: 'var(--ret-new)', Returning: 'var(--ret-returning)' };
 
-function fillSourceBar(rows) {
-  var bar = document.getElementById('srcBar');
-  var legend = document.getElementById('srcLegend');
+// rows: [{ [catKey]: 'Direct', [valueKey]: 42 }, ...] — unmatched categories
+// categories in "order" not present in rows are simply omitted (zero-width segment, no legend row).
+function fillCategoryBar(barId, legendId, rows, catKey, valueKey, order, colors, unitLabel) {
+  var bar = document.getElementById(barId);
+  var legend = document.getElementById(legendId);
   bar.textContent = '';
   legend.textContent = '';
   var byCategory = {};
   var total = 0;
-  (rows || []).forEach(function (r) { byCategory[r.category] = r.views; total += r.views; });
+  (rows || []).forEach(function (r) { byCategory[r[catKey]] = r[valueKey]; total += r[valueKey]; });
   if (!total) {
     var empty = el('div', 'empty'); empty.textContent = 'No data yet';
     legend.appendChild(empty);
     return;
   }
-  SRC_ORDER.forEach(function (cat) {
-    var views = byCategory[cat] || 0;
-    if (!views) return;
-    var pct = 100 * views / total;
+  order.forEach(function (cat) {
+    var val = byCategory[cat] || 0;
+    if (!val) return;
+    var pct = 100 * val / total;
     var seg = el('div', 'seg');
     seg.style.width = pct + '%';
-    seg.style.background = SRC_COLORS[cat];
-    seg.title = cat + ': ' + views + ' views (' + pct.toFixed(1) + '%)';
+    seg.style.background = colors[cat];
+    seg.title = cat + ': ' + val + ' ' + unitLabel + ' (' + pct.toFixed(1) + '%)';
     bar.appendChild(seg);
 
     var item = el('div', 'item');
-    var swatch = el('span', 'swatch'); swatch.style.background = SRC_COLORS[cat];
+    var swatch = el('span', 'swatch'); swatch.style.background = colors[cat];
     var label = el('span'); label.textContent = cat;
-    var pctSpan = el('span', 'pct'); pctSpan.textContent = views + ' · ' + pct.toFixed(1) + '%';
+    var pctSpan = el('span', 'pct'); pctSpan.textContent = val + ' · ' + pct.toFixed(1) + '%';
     item.appendChild(swatch); item.appendChild(label); item.appendChild(pctSpan);
     legend.appendChild(item);
   });
@@ -433,16 +486,23 @@ function formatDuration(sec) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
-function fillCards(totals, dayCount, engagement) {
+function fillCards(totals, dayCount, engagement, returning) {
   var cards = document.getElementById('cards');
   cards.textContent = '';
+  var newCount = 0, returningCount = 0;
+  (returning || []).forEach(function (r) {
+    if (r.visitorType === 'New') newCount = r.visitors; else returningCount = r.visitors;
+  });
+  var knownVisitors = newCount + returningCount;
+  var returningRate = knownVisitors ? Math.round(100 * returningCount / knownVisitors) + '%' : '—';
   var items = [
     ['Pageviews', totals.views],
     ['Unique visitors', totals.visitors],
     ['Avg. views / day', dayCount ? Math.round(totals.views / dayCount) : 0],
     ['Avg. time on page', formatDuration(totals.avgDuration)],
     ['Pages / session', (engagement.avgPagesPerSession || 0).toFixed(1)],
-    ['Bounce rate', Math.round(engagement.bounceRatePct || 0) + '%']
+    ['Bounce rate', Math.round(engagement.bounceRatePct || 0) + '%'],
+    ['Returning rate', returningRate]
   ];
   items.forEach(function (pair) {
     var card = el('div', 'card');
@@ -486,8 +546,9 @@ async function load() {
   var res = await fetch('/api/stats?' + qs);
   if (!res.ok) return;
   var data = await res.json();
-  fillCards(data.totals, data.daily.length, data.engagement);
-  fillSourceBar(data.sourceBreakdown);
+  fillCards(data.totals, data.daily.length, data.engagement, data.returning);
+  fillCategoryBar('srcBar', 'srcLegend', data.sourceBreakdown, 'category', 'views', SRC_ORDER, SRC_COLORS, 'views');
+  fillCategoryBar('retBar', 'retLegend', data.returning, 'visitorType', 'visitors', RET_ORDER, RET_COLORS, 'visitors');
   fillBars(data.daily);
   fillSiteOptions(data.allSites, site);
   fillTable('tblSites', data.sites, 'site', 'views');

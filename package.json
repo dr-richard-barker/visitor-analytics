@@ -12,6 +12,8 @@
     "db:migrate:remote:utm": "wrangler d1 execute visitor_analytics --remote --file=./migrations/0002_add_utm_and_source_category.sql",
     "db:migrate:local:geo": "wrangler d1 execute visitor_analytics --local --file=./migrations/0003_add_geo_duration_session.sql",
     "db:migrate:remote:geo": "wrangler d1 execute visitor_analytics --remote --file=./migrations/0003_add_geo_duration_session.sql",
+    "db:migrate:local:returning": "wrangler d1 execute visitor_analytics --local --file=./migrations/0004_add_returning_visitors.sql",
+    "db:migrate:remote:returning": "wrangler d1 execute visitor_analytics --remote --file=./migrations/0004_add_returning_visitors.sql",
     "secrets": "echo 'Run: wrangler secret put DASHBOARD_PASSWORD   and   wrangler secret put HASH_SALT'"
   },
   "devDependencies": {
