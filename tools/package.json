@@ -1,0 +1,9 @@
+{
+  "name": "visitor-analytics-tools",
+  "private": true,
+  "description": "Dev-time data generation scripts. Not deployed — see build_world_map_data.js.",
+  "dependencies": {
+    "iso-3166-1": "^2.1.1",
+    "topojson-client": "^3.1.0"
+  }
+}
